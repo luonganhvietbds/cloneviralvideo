@@ -1,110 +1,139 @@
-import { GoogleGenerativeAI, type GenerativeModel } from "@google/generative-ai";
+/**
+ * Client-side wrapper for Gemini API calls
+ * Calls serverless function instead of SDK directly to avoid CSP issues
+ */
 
-let client: GoogleGenerativeAI | null = null;
-let model: GenerativeModel | null = null;
+const API_ENDPOINT = "/api/gemini";
+
 let currentApiKey: string | null = null;
-
-const MODEL_NAME = process.env.NEXT_PUBLIC_GEMINI_MODEL || "gemini-2.5-flash-preview-05-20";
+let currentModel = "gemini-2.5-flash-preview-05-20";
 
 /**
- * Initialize Gemini client with API key
- * @param apiKey - The Gemini API key
- * @returns The GenerativeModel instance
+ * Initialize the Gemini client with API key
  */
-export function initGemini(apiKey: string): GenerativeModel {
-    // Only reinitialize if key changed
-    if (currentApiKey === apiKey && model) {
-        return model;
+export function initGemini(apiKey: string): void {
+    currentApiKey = apiKey;
+    console.log("[Gemini] API key set (will use server-side proxy)");
+}
+
+/**
+ * Set the model to use
+ */
+export function setModel(model: string): void {
+    currentModel = model;
+}
+
+/**
+ * Get the current model
+ */
+export function getModel(): string {
+    return currentModel;
+}
+
+interface GeminiRequestOptions {
+    prompt: string;
+    images?: string[];
+    systemInstruction?: string;
+}
+
+interface GeminiResponse {
+    text: string;
+}
+
+/**
+ * Generate content using the Gemini API via serverless proxy
+ */
+export async function generateContent(options: GeminiRequestOptions): Promise<string> {
+    if (!currentApiKey) {
+        throw new Error("API key not set. Call initGemini() first.");
     }
 
-    client = new GoogleGenerativeAI(apiKey);
-    model = client.getGenerativeModel({
-        model: MODEL_NAME,
-        generationConfig: {
-            temperature: 0.7,
-            topP: 0.95,
-            topK: 40,
-            maxOutputTokens: 8192,
+    const response = await fetch(API_ENDPOINT, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
         },
+        body: JSON.stringify({
+            apiKey: currentApiKey,
+            prompt: options.prompt,
+            images: options.images,
+            systemInstruction: options.systemInstruction,
+            model: currentModel,
+        }),
     });
 
-    currentApiKey = apiKey;
-    console.log(`[Gemini] Initialized with model: ${MODEL_NAME}`);
-
-    return model;
-}
-
-/**
- * Get the current Gemini model instance
- * @throws Error if not initialized
- */
-export function getModel(): GenerativeModel {
-    if (!model) {
-        throw new Error("Gemini not initialized. Call initGemini() first.");
+    if (!response.ok) {
+        const error = await response.json().catch(() => ({ error: "Unknown error" }));
+        throw new Error(error.error || `API request failed with status ${response.status}`);
     }
-    return model;
+
+    const data: GeminiResponse = await response.json();
+    return data.text;
 }
 
 /**
- * Check if Gemini is initialized
- */
-export function isGeminiInitialized(): boolean {
-    return model !== null;
-}
-
-/**
- * Send content to Gemini with images
- * @param textPrompt - The text prompt
- * @param images - Array of base64 image data URLs
- * @returns Promise<string> - The response text
+ * Generate content with images (for backward compatibility with agents)
  */
 export async function generateWithImages(
-    textPrompt: string,
-    images: string[]
+    prompt: string,
+    images: string[],
+    systemInstruction?: string
 ): Promise<string> {
-    const model = getModel();
-
-    // Convert data URLs to inline data parts
-    const imageParts = images.map((dataUrl) => {
-        // Extract base64 data and mime type
-        const matches = dataUrl.match(/^data:(.+);base64,(.+)$/);
-        if (!matches) {
-            throw new Error("Invalid image data URL format");
-        }
-
-        return {
-            inlineData: {
-                mimeType: matches[1],
-                data: matches[2],
-            },
-        };
+    return generateContent({
+        prompt,
+        images,
+        systemInstruction,
     });
-
-    const result = await model.generateContent([
-        { text: textPrompt },
-        ...imageParts,
-    ]);
-
-    const response = result.response;
-    return response.text();
 }
 
 /**
- * Parse JSON from Gemini response (handles markdown code blocks)
+ * Generate text without images
+ */
+export async function generateText(
+    prompt: string,
+    systemInstruction?: string
+): Promise<string> {
+    return generateContent({
+        prompt,
+        systemInstruction,
+    });
+}
+
+/**
+ * Parse JSON response from Gemini with error handling
  */
 export function parseJsonResponse<T>(text: string): T {
     // Remove markdown code blocks if present
-    let jsonText = text.trim();
+    let cleanedText = text.trim();
 
-    if (jsonText.startsWith("```json")) {
-        jsonText = jsonText.slice(7);
-    } else if (jsonText.startsWith("```")) {
-        jsonText = jsonText.slice(3);
+    // Remove ```json and ``` markers
+    if (cleanedText.startsWith("```json")) {
+        cleanedText = cleanedText.slice(7);
+    } else if (cleanedText.startsWith("```")) {
+        cleanedText = cleanedText.slice(3);
     }
 
-    if (jsonText.endsWith("```")) {
-        jsonText = jsonText.slice(0, -3);
+    if (cleanedText.endsWith("```")) {
+        cleanedText = cleanedText.slice(0, -3);
     }
 
-    return JSON.parse(jsonText.trim());
+    cleanedText = cleanedText.trim();
+
+    try {
+        return JSON.parse(cleanedText) as T;
+    } catch (error) {
+        console.error("[Gemini] Failed to parse JSON response:", cleanedText);
+        throw new Error("Failed to parse Gemini response as JSON");
+    }
+}
+
+/**
+ * Analyze images with Gemini Vision (alias for generateWithImages)
+ */
+export async function analyzeImages(
+    images: string[],
+    prompt: string,
+    systemInstruction?: string
+): Promise<string> {
+    return generateWithImages(prompt, images, systemInstruction);
 }
